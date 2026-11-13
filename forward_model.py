@@ -38,7 +38,7 @@ def forward_model(receiver_positions, config, density, julia_output, data_output
     with config_path.open("rb") as f:
         g = float(tomllib.load(f)["physics"]["g"])
 
-    with xr.open_dataset(julia_output_path) as ds:
+    with xr.open_dataset(julia_output_path, decode_times=False) as ds:
         time_name = "time" if "time" in ds else "t"
         t = ds[time_name].to_numpy()
         x = ds["x"].to_numpy()

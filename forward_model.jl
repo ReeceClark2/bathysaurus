@@ -58,7 +58,7 @@ end
 end
 
 function main(args)
-    llength(args) == 3 || error("Usage: julia --project=. forward_model.jl CONFIG.toml PROFILE.ascii OUTPUT.nc")
+    length(args) == 3 || error("Usage: julia --project=. forward_model.jl CONFIG.toml PROFILE.ascii OUTPUT.nc")
 
     config_path, profile_path, output_path = args
     cfg = TOML.parsefile(config_path)
