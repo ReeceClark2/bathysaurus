@@ -1,0 +1,64 @@
+[grid]
+Nx = 256
+Nz = 128
+Lx = 30.0
+H = 2.0
+
+[physics]
+g = 9.81
+rho_ref = 1025.0
+nu = 1.0e-6
+kappa = 1.0e-7
+
+[impulse]
+delta_u = 0.01
+sigma_x = 0.234375
+offset_from_right = 0.703125
+t0 = 12.0
+tau = 2.0
+
+[run]
+dt = 0.02
+stop_time = 180.0
+
+[output]
+interval = 1.0
+path = "density.nc"
+
+[dataset]
+seed = 2026
+train = 100
+validation = 20
+test = 20
+
+[profile.b]
+min = 0.2
+max = 2.0
+
+[profile.c]
+min = -1.5
+max = -0.5
+
+[profile.d]
+min = 0.05
+max = 0.35
+
+[[receivers]]
+x = 5.0
+z = -1.0
+
+[[receivers]]
+x = 12.0
+z = -1.0
+
+[[receivers]]
+x = 20.0
+z = -1.0
+
+[[receivers]]
+x = 25.0
+z = -1.0
+
+[parallel]
+allocated_cores = 40
+cores_per_forward_model = 8
