@@ -1,0 +1,9 @@
+data_root = "data"
+output_dir = "runs/bathysaurus"
+
+batch_size = 16
+epochs = 100
+learning_rate = 0.001
+weight_decay = 0.00001
+seed = 42
+num_workers = 4
