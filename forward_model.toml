@@ -1,3 +1,7 @@
+# Configuration for generate_datasets.py.
+# Datasets = [[cases]] x [receivers.sets]: 3 cases x 4 receiver sets = 12 datasets,
+# numbered in this order: 01-04 case 1 (r1, r2, r4, r8), 05-08 case 2, 09-12 case 3.
+
 [grid]
 Nx = 256
 Nz = 128
@@ -19,17 +23,20 @@ tau = 2.0
 
 [run]
 dt = 0.02
-stop_time = 180.0
+stop_time = 240.0
+# Pressure solver used only when the bathymetry is not flat:
+#   "cg"  = conjugate-gradient solver; enforces no flow through the seamount (slower).
+#   "fft" = FFT solver on the underlying flat grid; faster but leaks some flow through the seamount.
+immersed_pressure_solver = "cg"
 
 [output]
 interval = 1.0
-path = "density.nc"
 
 [dataset]
 seed = 2026
-train = 100
-validation = 20
-test = 20
+train = 1000
+validation = 200
+test = 200
 
 [profile.b]
 min = 0.2
@@ -43,22 +50,51 @@ max = -0.5
 min = 0.05
 max = 0.35
 
-[[receivers]]
-x = 5.0
-z = -1.0
-
-[[receivers]]
-x = 12.0
-z = -1.0
-
-[[receivers]]
-x = 20.0
-z = -1.0
-
-[[receivers]]
-x = 25.0
-z = -1.0
-
 [parallel]
-allocated_cores = 64
+# Number of concurrent Julia runs = allocated_cores // cores_per_forward_model (144 // 8 = 18).
+allocated_cores = 144
 cores_per_forward_model = 8
+# Keep each run's full density NetCDF (~47 MB each, ~13 GB total). Only needed if you
+# may want receivers at new positions later without re-running the simulations.
+keep_netcdf = false
+
+[bathymetry.flat]
+type = "flat"
+
+[bathymetry.seamount]
+type = "gaussian"
+center = 15.0   # m
+height = 1.0    # m above the flat bottom (half the depth)
+width = 1.5     # m, Gaussian standard deviation
+
+[receivers]
+# Receiver depth below the surface as a fraction of the LOCAL water depth
+# (0.5 = mid-water column; on the flat bottom this is z = -1.0 m).
+# Alternatively remove depth_fraction and set a fixed depth, e.g. z = -1.0
+# (every receiver must then lie at least one grid cell above the sea floor).
+depth_fraction = 0.5
+
+[receivers.sets]
+# Receiver x positions [m]. Sets are nested so each larger set adds receivers.
+# The source is near the right wall (x ~ 29.3 m); the seamount is centred at x = 15 m.
+r1 = [12.0]
+r2 = [12.0, 20.0]
+r4 = [5.0, 12.0, 20.0, 25.0]
+r8 = [2.5, 5.0, 8.5, 12.0, 17.0, 20.0, 22.5, 25.0]
+
+# noise_relative_std: white-noise standard deviation as a fraction of the RMS pressure
+# change (p(t) - p(0)) over all receivers for that sample. 0.1 = amplitude SNR of 10 (20 dB).
+[[cases]]
+name = "flat_noiseless"
+bathymetry = "flat"
+noise_relative_std = 0.0
+
+[[cases]]
+name = "flat_noisy"
+bathymetry = "flat"
+noise_relative_std = 0.2
+
+[[cases]]
+name = "seamount_noisy"
+bathymetry = "seamount"
+noise_relative_std = 0.2

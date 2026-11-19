@@ -4,10 +4,17 @@ using TOML
 using Printf
 
 # Run:
-# julia --project=. forward_model.jl config.toml density.ascii
+#   julia --project=. forward_model.jl CONFIG.toml PROFILE.ascii OUTPUT.nc [BATHYMETRY] [STOP_TIME]
 #
-# density.ascii: two whitespace-separated columns, z [m] and rho [kg/m^3].
+# PROFILE.ascii: two whitespace-separated columns, z [m] and rho [kg/m^3].
 # Rows must be ordered from bottom to top and located at z-cell centers.
+#
+# BATHYMETRY (optional) names a table [bathymetry.<name>] in CONFIG.toml:
+#   type = "flat"                                   flat bottom at z = -H
+#   type = "gaussian", center, height, width        bottom(x) = -H + height * exp(-(x - center)^2 / (2 width^2))
+# Default: flat bottom.
+#
+# STOP_TIME (optional) overrides run.stop_time; used for short preflight checks.
 
 function read_profile(path, Nz, z_expected, Δz)
     z_read = Float64[]
@@ -57,10 +64,44 @@ end
     return p.delta_u * horizontal * vertical * temporal
 end
 
-function main(args)
-    length(args) == 3 || error("Usage: julia --project=. forward_model.jl CONFIG.toml PROFILE.ascii OUTPUT.nc")
+# Returns `nothing` for a flat bottom, otherwise a function bottom(x) giving
+# the height of the sea floor (z, negative) at horizontal position x.
+function bottom_function(spec, Lx, H)
+    kind = get(spec, "type", "flat")
 
-    config_path, profile_path, output_path = args
+    kind == "flat" && return nothing
+
+    if kind == "gaussian"
+        center = Float64(spec["center"])
+        height = Float64(spec["height"])
+        width = Float64(spec["width"])
+
+        0 < center < Lx || error("Seamount center must lie inside (0, Lx)")
+        0 < height < H || error("Seamount height must lie inside (0, H)")
+        width > 0 || error("Seamount width must be positive")
+
+        return x -> -H + height * exp(-0.5 * ((x - center) / width)^2)
+    end
+
+    error("Unknown bathymetry type \"$kind\"; use \"flat\" or \"gaussian\"")
+end
+
+# Kinematic nonhydrostatic pressure [m^2/s^2]; the field's location differs between
+# Oceananigans versions.
+function nonhydrostatic_pressure(model)
+    hasproperty(model, :pressures) && hasproperty(model.pressures, :pNHS) &&
+        return model.pressures.pNHS
+    hasproperty(model, :nonhydrostatic_pressure) &&
+        return model.nonhydrostatic_pressure
+    error("Cannot find the nonhydrostatic pressure field in this Oceananigans version")
+end
+
+function main(args)
+    3 <= length(args) <= 5 ||
+        error("Usage: julia --project=. forward_model.jl CONFIG.toml PROFILE.ascii OUTPUT.nc [BATHYMETRY] [STOP_TIME]")
+
+    config_path, profile_path, output_path = args[1:3]
+    bathymetry_name = length(args) >= 4 ? args[4] : "flat"
     cfg = TOML.parsefile(config_path)
 
     grid_cfg = cfg["grid"]
@@ -98,7 +139,7 @@ function main(args)
         error("offset_from_right must be between 0 and Lx")
 
     dt = Float64(run_cfg["dt"])
-    stop_time = Float64(run_cfg["stop_time"])
+    stop_time = length(args) >= 5 ? parse(Float64, args[5]) : Float64(run_cfg["stop_time"])
     output_interval = Float64(output_cfg["interval"])
 
     dt > 0 && stop_time > 0 && output_interval > 0 ||
@@ -117,7 +158,18 @@ function main(args)
     # Boussinesq buoyancy: b = -g * (rho - rho_ref) / rho_ref.
     b_initial = @. -g * (rho_initial - rho_ref) / rho_ref
 
-    grid = RectilinearGrid(
+    # Bathymetry
+    bathymetry_tables = get(cfg, "bathymetry", Dict{String, Any}())
+    spec = if haskey(bathymetry_tables, bathymetry_name)
+        bathymetry_tables[bathymetry_name]
+    elseif bathymetry_name == "flat"
+        Dict{String, Any}("type" => "flat")
+    else
+        error("No [bathymetry.$bathymetry_name] table in $config_path")
+    end
+    bottom = bottom_function(spec, Lx, H)
+
+    underlying_grid = RectilinearGrid(
         size = (Nx, Nz),
         halo = (4, 4),
         x = (0.0, Lx),
@@ -125,20 +177,48 @@ function main(args)
         topology = (Bounded, Flat, Bounded)
     )
 
+    # With Flat y, the bottom-height function takes x only.
+    grid = isnothing(bottom) ? underlying_grid :
+           ImmersedBoundaryGrid(underlying_grid, GridFittedBottom(bottom))
+
+    bottom_height = isnothing(bottom) ? fill(-H, Nx) : [bottom(x) for x in x_centers]
+
     forcing_parameters = (;
         x_source = Lx - offset_from_right,
         sigma_x, t0, tau, delta_u, H
     )
     u_forcing = Forcing(impulse; parameters=forcing_parameters)
 
-    model = NonhydrostaticModel(
-        grid;
+    # Ask explicitly for a separate hydrostatic pressure anomaly, so the model's
+    # nonhydrostatic pressure is exactly the part NOT given by integrating density
+    # (rigid-lid surface pressure + true nonhydrostatic pressure). It is saved
+    # below as p_nh; Python adds it to g * integral(rho dz) for the full pressure.
+    model_kwargs = (;
+        hydrostatic_pressure_anomaly = CenterField(grid),
         buoyancy = BuoyancyTracer(),
         tracers = :b,
         advection = WENO(),
         closure = ScalarDiffusivity(; ν=nu, κ=kappa),
         forcing = (; u=u_forcing)
     )
+
+    # With an immersed seamount, the default FFT pressure solver ignores the
+    # boundary and lets some flow pass through it. The conjugate-gradient
+    # solver enforces no flow through the seamount (slower, more accurate).
+    if !isnothing(bottom)
+        solver_name = get(run_cfg, "immersed_pressure_solver", "cg")
+        if solver_name == "cg"
+            isdefined(Oceananigans.Solvers, :ConjugateGradientPoissonSolver) ||
+                error("This Oceananigans version has no ConjugateGradientPoissonSolver; " *
+                      "update Oceananigans or set run.immersed_pressure_solver = \"fft\"")
+            model_kwargs = merge(model_kwargs, (;
+                pressure_solver = Oceananigans.Solvers.ConjugateGradientPoissonSolver(grid)))
+        elseif solver_name != "fft"
+            error("run.immersed_pressure_solver must be \"cg\" or \"fft\"")
+        end
+    end
+
+    model = NonhydrostaticModel(grid; model_kwargs...)
 
     # With Flat y, initialization functions take (x, z), not (x, y, z).
     # Map each cell-center z to its corresponding supplied profile value.
@@ -162,6 +242,9 @@ function main(args)
                attrib=Dict("units" => "m", "positive" => "up"))
         defVar(ds, "x", x_centers, ("x",);
                attrib=Dict("units" => "m"))
+        defVar(ds, "bottom_height", bottom_height, ("x",);
+               attrib=Dict("units" => "m",
+                           "long_name" => "Analytic sea-floor height at x centers"))
         defVar(ds, "t", Float64, ("t",);
                attrib=Dict("units" => "seconds since simulation start"))
 
@@ -171,7 +254,16 @@ function main(args)
                    "long_name" => "Boussinesq-equivalent density"
                ))
 
+        defVar(ds, "p_nh", Float64, ("z", "x", "t");
+               attrib=Dict(
+                   "units" => "Pa",
+                   "long_name" => "Pressure not given by g * integral(rho dz): " *
+                                  "rigid-lid surface pressure + nonhydrostatic pressure",
+                   "gauge" => "mean over the top row of cells is zero at every time"
+               ))
+
         ds.attrib["rho_ref_kg_m-3"] = rho_ref
+        ds.attrib["bathymetry"] = bathymetry_name
         ds.attrib["source"] = "Right-side, zero-depth-mean horizontal impulse"
 
         frame_number = Ref(0)
@@ -194,7 +286,14 @@ function main(args)
                 (2, 1)
             )
 
+            # The pressure solve fixes p only up to a constant; set the mean
+            # over the top row of cells to zero (atmospheric reference).
+            p_xz = Array(interior(nonhydrostatic_pressure(sim.model), :, 1, :))
+            p_xz .-= sum(p_xz[:, end]) / size(p_xz, 1)
+            p_nh_zx = permutedims(rho_ref .* p_xz, (2, 1))
+
             ds["rho"][:, :, frame_number[]] = rho_zx
+            ds["p_nh"][:, :, frame_number[]] = p_nh_zx
             ds["t"][frame_number[]] = t
             last_saved_time[] = t
 
