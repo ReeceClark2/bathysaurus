@@ -354,10 +354,12 @@ def preflight(pool, plan, cfg, config_path, data_dir, profiles, threads, g):
               f"RMS nonhydrostatic + lid part {rms_nh:.3g} Pa", flush=True)
 
 
-def generate(config, resume=False, run_preflight=True):
+def generate(config, resume=False, run_preflight=True, cores=None):
     config_path = Path(config).resolve()
     with config_path.open("rb") as f:
         cfg = tomllib.load(f)
+    if cores is not None:  # e.g. from SLURM_CPUS_PER_TASK; may differ between submissions
+        cfg["parallel"]["allocated_cores"] = int(cores)
 
     if not (ROOT / "forward_model.jl").is_file():
         raise FileNotFoundError(ROOT / "forward_model.jl")
@@ -380,8 +382,15 @@ def generate(config, resume=False, run_preflight=True):
     if data_dir.exists():
         if not resume:
             raise FileExistsError(f"{data_dir} already exists; use --resume to continue it, or move it away")
-        if saved_config.exists() and saved_config.read_bytes() != config_path.read_bytes():
-            raise ValueError(f"{config_path} differs from {saved_config}, which this dataset was started with")
+        if saved_config.exists():
+            # Everything except [parallel] (core counts, keep_netcdf) must match the original run.
+            with saved_config.open("rb") as f:
+                saved = tomllib.load(f)
+            changed = sorted(k for k in set(saved) | set(cfg)
+                             if k != "parallel" and saved.get(k) != cfg.get(k))
+            if changed:
+                raise ValueError(f"{config_path} differs from {saved_config}, which this dataset was "
+                                 f"started with, in: {', '.join(changed)} (only [parallel] may change)")
     data_dir.mkdir(exist_ok=True)
     shutil.copy2(config_path, saved_config)
 
@@ -459,6 +468,8 @@ if __name__ == "__main__":
                         help="Continue an interrupted run in ./data (finished simulations are kept)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the short test run per bathymetry before production")
+    parser.add_argument("--cores", type=int,
+                        help="Override parallel.allocated_cores (e.g. $SLURM_CPUS_PER_TASK)")
     args = parser.parse_args()
-    generate(args.config, resume=args.resume, run_preflight=not args.skip_preflight)
+    generate(args.config, resume=args.resume, run_preflight=not args.skip_preflight, cores=args.cores)
     
