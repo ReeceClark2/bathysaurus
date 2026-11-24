@@ -1,9 +1,17 @@
 name: bathysaurus
 channels:
-  - pytorch
-  - conda-forge
+  - conda-forge          # PyTorch's own "pytorch" channel no longer receives releases; conda-forge builds PyTorch
 dependencies:
   - python=3.11
+
+  # Dataset generation (generate_datasets.py)
   - numpy
   - xarray
-  - pytorch
+  - netcdf4              # lets xarray read the NetCDF files written by forward_model.jl
+
+  # Training with OpenFWI (OpenFWI/ inside this folder)
+  - pytorch-cpu          # CPU build; for GPUs use pytorch-gpu instead (see the notes when creating the env)
+  - torchvision          # OpenFWI imports it in utils.py, dataset.py and train.py
+  - tensorboard          # train.py imports SummaryWriter even without --tensorboard
+  - scikit-learn         # OpenFWI's transforms.py imports it
+  - matplotlib           # plotting results; OpenFWI's vis.py and test.py
