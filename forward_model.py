@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
-"""Generate every density-inversion dataset in one run.
+"""Generate every density-inversion dataset for the towed-seamount tank in one run.
 
-Datasets = [[cases]] x [receivers.sets] in the TOML (3 x 4 = 12 by default).
+Datasets = [[cases]] x [receivers.sets] in the TOML (2 noise levels x 4 receiver sets = 8).
 
-The simulation depends only on the density profile and the bathymetry, so each
-profile is simulated ONCE per bathymetry (flat, seamount). Pressure is extracted
-from that run at every receiver used by any dataset; noise is added afterwards.
-Consequences:
-  * 2 x 140 simulations instead of 12 x 140.
-  * All 12 datasets share the same train/validation/test profiles (same seed as
-    before), so differences between datasets come only from receivers, noise
-    and bathymetry.
-  * Noise is white with a fixed standard deviation in Pa per case (noise_std_pa),
-    the same for every sample, like a real sensor's noise floor.
-  * A receiver at a given x gets the same noise realization in every dataset
-    that contains it.
-
-Simulations run flat bathymetry first, then seamount. Each (bathymetry, split)
-is written out to its datasets as soon as all of its runs finish.
+Each density profile is simulated ONCE (forward_model.jl: closed 2D tank, rigid lid, a ridge
+towed along the floor). Receivers ride with the seamount at fixed offsets from its centre;
+pressure is read at their moving positions from every saved frame. Noise is added afterwards,
+so all datasets share the same simulations and train/validation/test profiles, and a receiver
+at a given offset gets the same noise realization in every dataset that contains it.
 
 Usage:
     python forward_model.py forward_model.toml
@@ -44,15 +34,19 @@ SPLITS = ("train", "validation", "test")
 
 # --------------------------------------------------------------------------- plan
 
-def bottom_height(x, spec, H):
-    """Sea-floor height z(x) [m]; must match bottom_function in forward_model.jl."""
-    x = np.asarray(x, dtype=float)
-    kind = spec.get("type", "flat")
-    if kind == "flat":
-        return np.full_like(x, -H)
-    if kind == "gaussian":
-        return -H + float(spec["height"]) * np.exp(-0.5 * ((x - float(spec["center"])) / float(spec["width"])) ** 2)
-    raise ValueError(f"Unknown bathymetry type {kind!r}")
+GEOMETRY = "seamount"   # single geometry; its simulations live in data/simulations/seamount/
+
+
+def tow_position(t, seamount):
+    """Seamount centre x(t) [m]; must match tow_position in forward_model.jl.
+
+    Speed = speed * sin^2(pi (t - t_start) / duration) during the motion window, 0 outside it.
+    """
+    t = np.asarray(t, dtype=float)
+    start_x, speed = float(seamount["start_x"]), float(seamount["speed"])
+    t_start, duration = float(seamount["t_start"]), float(seamount["duration"])
+    s = np.clip(t - t_start, 0.0, duration)
+    return start_x - speed * (s / 2 - duration / (4 * np.pi) * np.sin(2 * np.pi * s / duration))
 
 
 def build_plan(cfg):
@@ -61,82 +55,67 @@ def build_plan(cfg):
     Lx, H = float(grid["Lx"]), float(grid["H"])
     if Nx < 1 or Nz < 1 or Lx <= 0 or H <= 0:
         raise ValueError("Check grid.Nx, Nz, Lx, H")
-    dz = H / Nz
-    x_centers = (np.arange(Nx) + 0.5) * Lx / Nx
+    dx, dz = Lx / Nx, H / Nz
     z_centers = -H + (np.arange(Nz) + 0.5) * dz
+
+    seamount = cfg["seamount"]
+    height, width = float(seamount["height"]), float(seamount["width"])
+    if not (0 < height < H and width > 0):
+        raise ValueError("Check seamount.height (inside (0, H)) and seamount.width (> 0)")
+    stop_time = float(cfg["run"]["stop_time"])
+    t_start, duration = float(seamount["t_start"]), float(seamount["duration"])
+    if t_start < 0 or duration <= 0:
+        raise ValueError("Check seamount.t_start (>= 0) and seamount.duration (> 0)")
+    if t_start + duration > stop_time:
+        raise ValueError(f"The seamount is still moving at stop_time ({t_start + duration:g} s > {stop_time:g} s)")
+    path = tow_position([0.0, stop_time], seamount)
+    if path.min() - width / 2 < dx or path.max() + width / 2 > Lx - dx:
+        raise ValueError(f"The seamount would touch a wall (centre from {path[0]:.2f} to {path[1]:.2f} m)")
 
     receiver_cfg = cfg["receivers"]
     receiver_sets = {name: [float(x) for x in xs] for name, xs in receiver_cfg["sets"].items()}
     if not receiver_sets or any(not xs for xs in receiver_sets.values()):
         raise ValueError("Every receiver set needs at least one receiver")
-    depth_options = [k for k in ("depth_fraction", "z", "height_above_bottom") if k in receiver_cfg]
-    if len(depth_options) != 1:
-        raise ValueError("Set exactly one of receivers.depth_fraction, receivers.z "
-                         "or receivers.height_above_bottom")
-    union_x = sorted({x for xs in receiver_sets.values() for x in xs})
+    height_above_bottom = float(receiver_cfg["height_above_bottom"])
+    if not dz <= height_above_bottom < H:
+        raise ValueError(f"receivers.height_above_bottom must be at least one cell ({dz:.4f} m)")
+    offsets = sorted({x for xs in receiver_sets.values() for x in xs})
+    clearance = width / 2 + 0.1
+    for offset in offsets:
+        if abs(offset) < clearance:
+            raise ValueError(f"Receiver offset {offset} m is on or next to the seamount; keep |offset| >= {clearance:.2f} m "
+                             "(the pressure next to the moving solid is less accurate)")
+        positions = path + offset
+        if positions.min() < dx or positions.max() > Lx - dx:
+            raise ValueError(f"Receiver offset {offset} m leaves the tank during the run "
+                             f"(x from {positions[0]:.2f} to {positions[1]:.2f} m)")
+    receivers = [(offset, -H + height_above_bottom) for offset in offsets]
 
-    bathymetry_tables = cfg.get("bathymetry", {})
     cases = cfg["cases"]
     names = [case["name"] for case in cases]
     if len(set(names)) != len(names):
         raise ValueError("Case names must be unique")
 
-    geometries = {}
+    geometry = {"spec": {"type": "towed", **seamount}, "receivers": receivers, "datasets": []}
     datasets = []
     for case in cases:
-        bathy = case["bathymetry"]
-        if bathy not in bathymetry_tables and bathy != "flat":
-            raise ValueError(f"Case {case['name']!r} uses unknown bathymetry {bathy!r}")
-        spec = bathymetry_tables.get(bathy, {"type": "flat"})
-        if spec.get("type", "flat") == "gaussian":
-            if not (0 < float(spec["center"]) < Lx and 0 < float(spec["height"]) < H and float(spec["width"]) > 0):
-                raise ValueError(f"Invalid seamount parameters for {bathy!r}")
-
         if "noise_relative_std" in case:
-            raise ValueError(f"Case {case['name']!r}: noise_relative_std is no longer supported; "
-                             "use noise_std_pa (fixed noise standard deviation in Pa)")
+            raise ValueError(f"Case {case['name']!r}: use noise_std_pa (fixed noise standard deviation in Pa)")
         noise_std_pa = float(case.get("noise_std_pa", 0.0))
         if not np.isfinite(noise_std_pa) or noise_std_pa < 0:
             raise ValueError(f"noise_std_pa must be >= 0 for case {case['name']!r}")
-
-        if bathy not in geometries:
-            bed = bottom_height(union_x, spec, H)
-            if "depth_fraction" in receiver_cfg:
-                fraction = float(receiver_cfg["depth_fraction"])
-                if not 0 < fraction < 1:
-                    raise ValueError("receivers.depth_fraction must lie in (0, 1)")
-                rz = fraction * bed
-            elif "height_above_bottom" in receiver_cfg:
-                # Sensor resting on the bed: a fixed small height above the local sea floor.
-                rz = bed + float(receiver_cfg["height_above_bottom"])
-            else:
-                rz = np.full_like(bed, float(receiver_cfg["z"]))
-            for x, z, b in zip(union_x, rz, bed):
-                if not x_centers[0] <= x <= x_centers[-1]:
-                    raise ValueError(f"Receiver x={x} is outside the x-center range")
-                if not b + dz <= z < 0:
-                    raise ValueError(
-                        f"Receiver (x={x}, z={z:.3f}) is not in the water column for bathymetry "
-                        f"{bathy!r} (sea floor at z={b:.3f}; need at least one cell, {dz:.4f} m, above it"
-                        f"{'; increase height_above_bottom' if 'height_above_bottom' in receiver_cfg else ''})")
-            geometries[bathy] = {
-                "spec": spec,
-                "receivers": [(float(x), float(z)) for x, z in zip(union_x, rz)],
-                "datasets": [],
-            }
-
         for set_name, xs in receiver_sets.items():
             dataset = {
                 "name": f"{len(datasets) + 1:02d}_{case['name']}_{set_name}",
                 "case": case["name"],
-                "bathymetry": bathy,
+                "bathymetry": GEOMETRY,
                 "noise_std_pa": noise_std_pa,
-                "columns": [union_x.index(x) for x in xs],
+                "columns": [offsets.index(x) for x in xs],
             }
             datasets.append(dataset)
-            geometries[bathy]["datasets"].append(dataset)
+            geometry["datasets"].append(dataset)
 
-    return {"z": z_centers, "H": H, "geometries": geometries, "datasets": datasets}
+    return {"z": z_centers, "H": H, "geometries": {GEOMETRY: geometry}, "datasets": datasets}
 
 
 def draw_profiles(cfg, z):
@@ -176,35 +155,37 @@ def draw_profiles(cfg, z):
 # ------------------------------------------------------------------ simulation
 
 def receiver_pressure(nc_path, receivers, g):
-    """Full pressure [Pa] at each receiver, relative to atmospheric at the surface.
+    """Full pressure [Pa] at receivers riding with the seamount, relative to the surface.
 
-    full = g * integral(rho dz) from the receiver to the surface   (hydrostatic part)
-         + p_nh from the model (rigid-lid surface pressure + nonhydrostatic pressure).
+    receivers: (offset from the seamount centre [m], z [m]) pairs. At each frame the receiver
+    sits at x = seamount_x(t) + offset; fields are interpolated linearly between grid columns.
+    full = g * integral(rho dz) from the receiver to the surface + p_nh from the model.
     Returns t, z, full pressure (T, R) and the hydrostatic part alone (T, R).
     """
     with xr.open_dataset(nc_path, decode_times=False) as ds:
-        time_name = "time" if "time" in ds else "t"
-        t = ds[time_name].to_numpy()
+        t = ds["t"].to_numpy()
         x = ds["x"].to_numpy()
         z = ds["z"].to_numpy()
-        rho = ds["rho"].transpose(time_name, "x", "z").to_numpy()
-        if "p_nh" not in ds:
-            raise ValueError(f"{nc_path} has no p_nh variable; use the updated forward_model.jl")
-        p_nh = ds["p_nh"].transpose(time_name, "x", "z").to_numpy()
-        bed = ds["bottom_height"].to_numpy() if "bottom_height" in ds else np.full_like(x, z[0] - 0.5 * (z[1] - z[0]))
+        seamount_x = ds["seamount_x"].to_numpy()
+        rho = ds["rho"].transpose("t", "x", "z").to_numpy()
+        p_nh = ds["p_nh"].transpose("t", "x", "z").to_numpy()
 
-    if not np.all(np.isfinite(rho)) or not np.all(np.diff(t) > 0):
-        raise ValueError("Simulation contains non-finite density or invalid times")
+    if not np.all(np.isfinite(rho)) or not np.all(np.isfinite(p_nh)) or not np.all(np.diff(t) > 0):
+        raise ValueError("Simulation contains non-finite fields or invalid times")
 
+    frames = np.arange(len(t))
     hydrostatic, nonhydrostatic = [], []
-    for receiver_x, receiver_z in receivers:
-        ix = int(np.argmin(np.abs(x - receiver_x)))
-        if not bed[ix] < receiver_z <= 0:
-            raise ValueError(f"Receiver ({receiver_x}, {receiver_z}) is below the sea floor ({bed[ix]:.3f})")
+    for offset, receiver_z in receivers:
+        xr_t = seamount_x + offset                                   # receiver position per frame
+        i = np.clip(np.searchsorted(x, xr_t) - 1, 0, len(x) - 2)
+        w = np.clip((xr_t - x[i]) / (x[i + 1] - x[i]), 0.0, 1.0)[:, None]
+        rho_col = (1 - w) * rho[frames, i, :] + w * rho[frames, i + 1, :]       # (T, Nz)
+        pnh_col = (1 - w) * p_nh[frames, i, :] + w * p_nh[frames, i + 1, :]
+
         z_nodes = np.concatenate(([receiver_z], z[(z > receiver_z) & (z < 0)], [0.0]))
-        rho_nodes = np.vstack([np.interp(z_nodes, z, profile) for profile in rho[:, ix, :]])
+        rho_nodes = np.vstack([np.interp(z_nodes, z, column) for column in rho_col])
         hydrostatic.append(g * np.sum(0.5 * (rho_nodes[:, :-1] + rho_nodes[:, 1:]) * np.diff(z_nodes), axis=1))
-        nonhydrostatic.append(np.array([np.interp(receiver_z, z, profile) for profile in p_nh[:, ix, :]]))
+        nonhydrostatic.append(np.array([np.interp(receiver_z, z, column) for column in pnh_col]))
 
     hydrostatic = np.stack(hydrostatic, axis=-1)
     pressure = hydrostatic + np.stack(nonhydrostatic, axis=-1)
@@ -268,9 +249,11 @@ def write_dataset_metadata(plan, data_dir):
             metadata = {
                 "name": dataset["name"],
                 "case": dataset["case"],
-                "bathymetry": {"name": dataset["bathymetry"], **geometry["spec"]},
+                "seamount": geometry["spec"],
                 "noise_std_pa": dataset["noise_std_pa"],
-                "receivers": [{"x": x, "z": z} for x, z in receivers],
+                "receivers": [{"offset_from_seamount_centre": x, "z": z} for x, z in receivers],
+                "receiver_note": "receivers move with the seamount: x(t) = seamount centre + offset "
+                                 "(negative = ahead of it, positive = behind)",
                 "data_shape": "(1, 1, n_times, n_receivers), receiver order as listed; full pressure "
                               "(hydrostatic + nonhydrostatic) in Pa, zero at the surface",
                 "model_shape": "(1, 1, Nz), density in kg/m^3 at z.npy",
@@ -340,9 +323,9 @@ def preflight(pool, plan, cfg, config_path, data_dir, profiles, threads, g):
     split, (run, *_ ) = first
     profile_path = data_dir / "profiles" / split / f"profile_{run:06d}.ascii"
 
-    impulse = cfg["impulse"]
+    seamount = cfg["seamount"]  # short run into the start of the motion
     stop_time = min(float(cfg["run"]["stop_time"]),
-                    float(impulse["t0"]) + 2 * float(impulse["tau"]) + 2 * float(cfg["output"]["interval"]))
+                    float(seamount["t_start"]) + 0.1 * float(seamount["duration"]) + 2 * float(cfg["output"]["interval"]))
 
     preflight_dir = data_dir / "preflight"
     shutil.rmtree(preflight_dir, ignore_errors=True)
@@ -363,8 +346,15 @@ def preflight(pool, plan, cfg, config_path, data_dir, profiles, threads, g):
             t, pressure, hydrostatic = f["t"], f["pressure"], f["pressure_hydrostatic"]
         rms_change = np.sqrt(np.mean((pressure - pressure[:1]) ** 2))
         rms_nh = np.sqrt(np.mean((pressure - hydrostatic) ** 2))
+        # 1e4 Pa is about 1 m of water: no realistic tank signal comes near it.
+        if not np.isfinite(rms_change) or rms_change > 1e4 or rms_nh > 1e4:
+            raise RuntimeError(f"Preflight {name}: implausible pressure (RMS change {rms_change:.3g} Pa, "
+                               f"nonhydrostatic + surface part {rms_nh:.3g} Pa); the pressure solve has "
+                               f"probably failed. No production runs were started.")
         print(f"Preflight {name}: OK, {len(t)} frames; RMS pressure change so far {rms_change:.3g} Pa, "
               f"RMS nonhydrostatic + lid part {rms_nh:.3g} Pa", flush=True)
+        if rms_change == 0:
+            print(f"Preflight {name}: warning, no pressure change at all; check the [seamount] motion", flush=True)
 
 
 def generate(config, resume=False, run_preflight=True, cores=None):
@@ -423,6 +413,8 @@ def generate(config, resume=False, run_preflight=True, cores=None):
           f"up to {max_workers} concurrent Julia runs, {threads} threads each", flush=True)
     for geometry_name, geometry in plan["geometries"].items():
         print(f"  {geometry_name}: " + ", ".join(d["name"] for d in geometry["datasets"]), flush=True)
+        print(f"  receiver offsets from the seamount centre [m]: "
+              + ", ".join(f"{x:+g}" for x, _ in geometry["receivers"]), flush=True)
 
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
         if run_preflight:
@@ -483,7 +475,7 @@ def generate(config, resume=False, run_preflight=True, cores=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("config", help="Path to generate_datasets.toml")
+    parser.add_argument("config", help="Path to forward_model.toml")
     parser.add_argument("--resume", action="store_true",
                         help="Continue an interrupted run in ./data (finished simulations are kept)")
     parser.add_argument("--skip-preflight", action="store_true",
