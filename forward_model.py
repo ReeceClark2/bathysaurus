@@ -11,6 +11,8 @@ Consequences:
   * All 12 datasets share the same train/validation/test profiles (same seed as
     before), so differences between datasets come only from receivers, noise
     and bathymetry.
+  * Noise is white with a fixed standard deviation in Pa per case (noise_std_pa),
+    the same for every sample, like a real sensor's noise floor.
   * A receiver at a given x gets the same noise realization in every dataset
     that contains it.
 
@@ -18,8 +20,8 @@ Simulations run flat bathymetry first, then seamount. Each (bathymetry, split)
 is written out to its datasets as soon as all of its runs finish.
 
 Usage:
-    python generate_datasets.py generate_datasets.toml
-    python generate_datasets.py generate_datasets.toml --resume   # after a crash or walltime limit
+    python forward_model.py forward_model.toml
+    python forward_model.py forward_model.toml --resume   # after a crash or walltime limit
 """
 
 import argparse
@@ -67,8 +69,10 @@ def build_plan(cfg):
     receiver_sets = {name: [float(x) for x in xs] for name, xs in receiver_cfg["sets"].items()}
     if not receiver_sets or any(not xs for xs in receiver_sets.values()):
         raise ValueError("Every receiver set needs at least one receiver")
-    if ("depth_fraction" in receiver_cfg) == ("z" in receiver_cfg):
-        raise ValueError("Set exactly one of receivers.depth_fraction or receivers.z")
+    depth_options = [k for k in ("depth_fraction", "z", "height_above_bottom") if k in receiver_cfg]
+    if len(depth_options) != 1:
+        raise ValueError("Set exactly one of receivers.depth_fraction, receivers.z "
+                         "or receivers.height_above_bottom")
     union_x = sorted({x for xs in receiver_sets.values() for x in xs})
 
     bathymetry_tables = cfg.get("bathymetry", {})
@@ -88,9 +92,12 @@ def build_plan(cfg):
             if not (0 < float(spec["center"]) < Lx and 0 < float(spec["height"]) < H and float(spec["width"]) > 0):
                 raise ValueError(f"Invalid seamount parameters for {bathy!r}")
 
-        level = float(case.get("noise_relative_std", 0.0))
-        if not np.isfinite(level) or level < 0:
-            raise ValueError(f"noise_relative_std must be >= 0 for case {case['name']!r}")
+        if "noise_relative_std" in case:
+            raise ValueError(f"Case {case['name']!r}: noise_relative_std is no longer supported; "
+                             "use noise_std_pa (fixed noise standard deviation in Pa)")
+        noise_std_pa = float(case.get("noise_std_pa", 0.0))
+        if not np.isfinite(noise_std_pa) or noise_std_pa < 0:
+            raise ValueError(f"noise_std_pa must be >= 0 for case {case['name']!r}")
 
         if bathy not in geometries:
             bed = bottom_height(union_x, spec, H)
@@ -99,6 +106,9 @@ def build_plan(cfg):
                 if not 0 < fraction < 1:
                     raise ValueError("receivers.depth_fraction must lie in (0, 1)")
                 rz = fraction * bed
+            elif "height_above_bottom" in receiver_cfg:
+                # Sensor resting on the bed: a fixed small height above the local sea floor.
+                rz = bed + float(receiver_cfg["height_above_bottom"])
             else:
                 rz = np.full_like(bed, float(receiver_cfg["z"]))
             for x, z, b in zip(union_x, rz, bed):
@@ -107,7 +117,8 @@ def build_plan(cfg):
                 if not b + dz <= z < 0:
                     raise ValueError(
                         f"Receiver (x={x}, z={z:.3f}) is not in the water column for bathymetry "
-                        f"{bathy!r} (sea floor at z={b:.3f}; need at least one cell, {dz:.4f} m, above it)")
+                        f"{bathy!r} (sea floor at z={b:.3f}; need at least one cell, {dz:.4f} m, above it"
+                        f"{'; increase height_above_bottom' if 'height_above_bottom' in receiver_cfg else ''})")
             geometries[bathy] = {
                 "spec": spec,
                 "receivers": [(float(x), float(z)) for x, z in zip(union_x, rz)],
@@ -119,7 +130,7 @@ def build_plan(cfg):
                 "name": f"{len(datasets) + 1:02d}_{case['name']}_{set_name}",
                 "case": case["name"],
                 "bathymetry": bathy,
-                "noise_relative_std": level,
+                "noise_std_pa": noise_std_pa,
                 "columns": [union_x.index(x) for x in xs],
             }
             datasets.append(dataset)
@@ -258,7 +269,7 @@ def write_dataset_metadata(plan, data_dir):
                 "name": dataset["name"],
                 "case": dataset["case"],
                 "bathymetry": {"name": dataset["bathymetry"], **geometry["spec"]},
-                "noise_relative_std": dataset["noise_relative_std"],
+                "noise_std_pa": dataset["noise_std_pa"],
                 "receivers": [{"x": x, "z": z} for x, z in receivers],
                 "data_shape": "(1, 1, n_times, n_receivers), receiver order as listed; full pressure "
                               "(hydrostatic + nonhydrostatic) in Pa, zero at the surface",
@@ -286,16 +297,17 @@ def finalize_split(plan, geometry_name, split, profiles, data_dir, seed):
         elif not np.array_equal(t, reference_t):
             raise ValueError(f"Time samples changed in {geometry_name} {split} run {run}")
 
-        # Noise scale: RMS pressure change over all receivers of this sample.
-        rms_change = float(np.sqrt(np.mean((pressure - pressure[:1]) ** 2)))
+        change = pressure - pressure[:1]
         # Same seed key for every dataset -> receiver at x sees the same realization everywhere.
         unit_noise = np.random.default_rng([int(seed), split_index, run]).standard_normal(pressure.shape)
         target = density[None, None, :].astype(np.float32)
 
         for dataset in geometry["datasets"]:
             columns = dataset["columns"]
-            sigma = dataset["noise_relative_std"] * rms_change
+            sigma = dataset["noise_std_pa"]  # fixed sensor noise, the same for every sample
             data = pressure[:, columns] + sigma * unit_noise[:, columns]
+            # RMS signal (p(t) - p(0)) over this dataset's receivers, for reference
+            rms_change = float(np.sqrt(np.mean(change[:, columns] ** 2)))
             out_dir = data_dir / "datasets" / dataset["name"] / split
             data_path = out_dir / f"data_{run:06d}.npy"
             model_path = out_dir / f"model_{run:06d}.npy"
@@ -311,10 +323,11 @@ def finalize_split(plan, geometry_name, split, profiles, data_dir, seed):
         with (dataset_dir / f"{split}.txt").open("w", encoding="utf-8") as annotations, \
              (dataset_dir / split / "parameters.csv").open("w", newline="", encoding="utf-8") as params:
             writer = csv.writer(params)
-            writer.writerow(("run", "b", "c", "d", "rms_pressure_change_pa", "noise_std_pa"))
+            writer.writerow(("run", "b", "c", "d", "rms_pressure_change_pa", "noise_std_pa", "snr"))
             for run, b, c, d, rms_change, sigma, data_path, model_path in records[dataset["name"]]:
                 annotations.write(f"{data_path.resolve()}\t{model_path.resolve()}\n")
-                writer.writerow((run, b, c, d, rms_change, sigma))
+                snr = rms_change / sigma if sigma > 0 else float("inf")
+                writer.writerow((run, b, c, d, rms_change, sigma, snr))
 
 
 # ------------------------------------------------------------------------ main
@@ -383,19 +396,26 @@ def generate(config, resume=False, run_preflight=True, cores=None):
         if not resume:
             raise FileExistsError(f"{data_dir} already exists; use --resume to continue it, or move it away")
         if saved_config.exists():
-            # Everything except [parallel] (core counts, keep_netcdf) must match the original run.
+            # Everything that affects the simulations must match the original run. [parallel]
+            # and [[cases]] (names, noise) may change: datasets are rebuilt from the saved
+            # simulations. A case with a new bathymetry simply gets its simulations run.
             with saved_config.open("rb") as f:
                 saved = tomllib.load(f)
             changed = sorted(k for k in set(saved) | set(cfg)
-                             if k != "parallel" and saved.get(k) != cfg.get(k))
+                             if k not in ("parallel", "cases") and saved.get(k) != cfg.get(k))
             if changed:
                 raise ValueError(f"{config_path} differs from {saved_config}, which this dataset was "
-                                 f"started with, in: {', '.join(changed)} (only [parallel] may change)")
+                                 f"started with, in: {', '.join(changed)} (only [parallel] and [[cases]] may change)")
     data_dir.mkdir(exist_ok=True)
     shutil.copy2(config_path, saved_config)
 
     write_profiles(profiles, plan["z"], data_dir)
     write_dataset_metadata(plan, data_dir)
+    stale = sorted(p.name for p in (data_dir / "datasets").iterdir()
+                   if p.is_dir() and p.name not in {d["name"] for d in plan["datasets"]})
+    if stale:
+        print(f"Note: data/datasets has folders not in the current TOML (left untouched): "
+              f"{', '.join(stale)}", flush=True)
 
     total_runs = len(plan["geometries"]) * sum(len(rows) for rows in profiles.values())
     print(f"{len(plan['datasets'])} datasets from {total_runs} simulations "
@@ -472,4 +492,3 @@ if __name__ == "__main__":
                         help="Override parallel.allocated_cores (e.g. $SLURM_CPUS_PER_TASK)")
     args = parser.parse_args()
     generate(args.config, resume=args.resume, run_preflight=not args.skip_preflight, cores=args.cores)
-    

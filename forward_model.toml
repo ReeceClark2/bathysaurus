@@ -1,36 +1,42 @@
-# Configuration for generate_datasets.py.
+# Configuration for forward_model.py (dataset generation) and forward_model.jl (Oceananigans).
 # Datasets = [[cases]] x [receivers.sets]: 3 cases x 4 receiver sets = 12 datasets,
 # numbered in this order: 01-04 case 1 (r1, r2, r4, r8), 05-08 case 2, 09-12 case 3.
 
 [grid]
 Nx = 256
 Nz = 128
-Lx = 30.0
-H = 2.0
+Lx = 30.0          # m (forward_model.jl requires 30)
+H = 2.0            # m (forward_model.jl requires 2)
 
 [physics]
 g = 9.81
 rho_ref = 1025.0
-nu = 1.0e-6
-kappa = 1.0e-7
+nu = 1.0e-6        # m^2/s, viscosity of water
+kappa = 1.0e-7     # m^2/s, diffusivity of the density tracer
 
 [impulse]
-delta_u = 0.01
-sigma_x = 0.234375
-offset_from_right = 0.703125
-t0 = 12.0
-tau = 2.0
+# Source near the right wall: a(x, z, t) = delta_u * Gaussian(x) * shape(z) * Gaussian(t) / (sqrt(2 pi) tau)
+# vertical = "uniform": same push at every depth, into the tank (piston-like; needs free_surface = true)
+# vertical = "mode1":   bottom half pushed toward the wall, top half away (internal-wave paddle)
+vertical = "uniform"
+delta_u = 0.2              # m/s, total velocity kick if unresisted (check with calibrate_source.py)
+sigma_x = 0.4              # m, horizontal width (standard deviation)
+offset_from_right = 1.0    # m, source centre distance from the right wall (keep >= 2.5 sigma_x)
+t0 = 16.0                  # s, time of peak push (keep >= 3 tau so it starts smoothly)
+tau = 4.0                  # s, duration (standard deviation)
 
 [run]
 dt = 0.02
-stop_time = 240.0
+stop_time = 360.0          # s, long enough for the slowest internal waves to cross the tank
+free_surface = true        # implicit free surface (false = rigid lid)
 # Pressure solver used only when the bathymetry is not flat:
 #   "cg"  = conjugate-gradient solver; enforces no flow through the seamount (slower).
 #   "fft" = FFT solver on the underlying flat grid; faster but leaks some flow through the seamount.
+# If the seamount preflight fails with the free surface, try "fft" or update Oceananigans.
 immersed_pressure_solver = "cg"
 
 [output]
-interval = 1.0
+interval = 1.0             # s between saved frames
 
 [dataset]
 seed = 2026
@@ -38,24 +44,25 @@ train = 1000
 validation = 200
 test = 200
 
-[profile.b]
-min = 0.2
-max = 2.0
+# Density profiles: rho(z) = rho_ref - b * tanh((z - c) / d)
+[profile.b]                # half the density jump [kg/m^3]: total jump 2-20 kg/m^3 (salt-stratified tank)
+min = 1.0
+max = 10.0
 
-[profile.c]
+[profile.c]                # interface depth [m]
 min = -1.5
 max = -0.5
 
-[profile.d]
+[profile.d]                # interface thickness scale [m]: transition over ~3d
 min = 0.05
 max = 0.35
 
 [parallel]
-# Number of concurrent Julia runs = allocated_cores // cores_per_forward_model (144 // 8 = 18).
+# Concurrent Julia runs = cores // cores_per_forward_model. The batch script passes the
+# job's cores with --cores, which overrides allocated_cores.
 allocated_cores = 144
 cores_per_forward_model = 8
-# Keep each run's full density NetCDF (~47 MB each, ~13 GB total). Only needed if you
-# may want receivers at new positions later without re-running the simulations.
+# Keep each run's full NetCDF (density, pressure, surface; ~95 MB each, ~260 GB for 2800 runs).
 keep_netcdf = false
 
 [bathymetry.flat]
@@ -63,38 +70,36 @@ type = "flat"
 
 [bathymetry.seamount]
 type = "gaussian"
-center = 15.0   # m
-height = 1.0    # m above the flat bottom (half the depth)
-width = 1.5     # m, Gaussian standard deviation
+center = 15.0              # m
+height = 1.0               # m above the flat bottom (half the depth)
+width = 1.5                # m, Gaussian standard deviation
 
 [receivers]
-# Receiver depth below the surface as a fraction of the LOCAL water depth
-# (0.5 = mid-water column; on the flat bottom this is z = -1.0 m).
-# Alternatively remove depth_fraction and set a fixed depth, e.g. z = -1.0
-# (every receiver must then lie at least one grid cell above the sea floor).
-depth_fraction = 0.5
+# Sensors resting on the bottom: a fixed height above the local sea floor
+# (must be at least one grid cell, H/Nz = 0.0156 m).
+# Alternatives (use exactly one): depth_fraction = 0.5 (mid-water) or z = -1.0 (fixed depth).
+height_above_bottom = 0.02
 
 [receivers.sets]
 # Receiver x positions [m]. Sets are nested so each larger set adds receivers.
-# The source is near the right wall (x ~ 29.3 m); the seamount is centred at x = 15 m.
+# The source is at x = 29 m; the seamount is centred at x = 15 m.
 r1 = [12.0]
 r2 = [12.0, 20.0]
 r4 = [5.0, 12.0, 20.0, 25.0]
 r8 = [2.5, 5.0, 8.5, 12.0, 17.0, 20.0, 22.5, 25.0]
 
-# noise_relative_std: white-noise standard deviation as a fraction of the RMS pressure
-# change (p(t) - p(0)) over all receivers for that sample. 0.1 = amplitude SNR of 10 (20 dB).
+# noise_std_pa: white-noise standard deviation in Pa, the same for every sample and receiver.
 [[cases]]
 name = "flat_noiseless"
 bathymetry = "flat"
-noise_relative_std = 0.0
+noise_std_pa = 0.0
 
 [[cases]]
 name = "flat_noisy"
 bathymetry = "flat"
-noise_relative_std = 0.2
+noise_std_pa = 0.8
 
 [[cases]]
 name = "seamount_noisy"
 bathymetry = "seamount"
-noise_relative_std = 0.2
+noise_std_pa = 0.8

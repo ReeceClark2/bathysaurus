@@ -15,6 +15,18 @@ using Printf
 # Default: flat bottom.
 #
 # STOP_TIME (optional) overrides run.stop_time; used for short preflight checks.
+#
+# Source shape ([impulse] vertical):
+#   "mode1"   (default) cos(pi (z + H) / H): bottom half pushed toward the right wall, top
+#             half toward the tank interior, zero net push. An internal-wave paddle.
+#   "uniform" the same push at every depth, directed into the tank (toward -x):
+#             a piston-like source near the right wall. Needs run.free_surface = true,
+#             because under a rigid lid a depth-uniform push is balanced by pressure alone.
+#
+# Top boundary ([run] free_surface):
+#   false (default) rigid lid.
+#   true  implicit free surface (needs a recent Oceananigans with
+#         NonhydrostaticModel(...; free_surface = ImplicitFreeSurface())).
 
 function read_profile(path, Nz, z_expected, Δz)
     z_read = Float64[]
@@ -54,10 +66,11 @@ end
 
 # A localized horizontal acceleration [m/s^2].
 # The temporal Gaussian integrates to approximately delta_u.
-# cos(pi * (z + H) / H) has zero depth mean: it excites baroclinic motion.
+# mode1: cos(pi * (z + H) / H) has zero depth mean and excites baroclinic motion.
+# uniform: depth-uniform push into the tank (-x), like a piston at the right wall.
 @inline function impulse(x, z, t, p)
     horizontal = exp(-0.5 * ((x - p.x_source) / p.sigma_x)^2)
-    vertical = cos(pi * (z + p.H) / p.H)
+    vertical = p.uniform ? -one(z) : cos(pi * (z + p.H) / p.H)
     temporal = exp(-0.5 * ((t - p.t0) / p.tau)^2) /
                (sqrt(2pi) * p.tau)
 
@@ -97,6 +110,14 @@ function nonhydrostatic_pressure(model)
 end
 
 function main(args)
+    # Run FFTW (used by the pressure solvers) single-threaded. Its multithreading can
+    # crash on Windows (EXCEPTION_ACCESS_VIOLATION in fftw_threads_set_callback), and
+    # these FFTs (Nx x Nz) are too small to benefit from threads. Oceananigans' own
+    # kernels still use all --threads.
+    if isdefined(Oceananigans.Solvers, :FFTW)
+        Oceananigans.Solvers.FFTW.set_num_threads(1)
+    end
+
     3 <= length(args) <= 5 ||
         error("Usage: julia --project=. forward_model.jl CONFIG.toml PROFILE.ascii OUTPUT.nc [BATHYMETRY] [STOP_TIME]")
 
@@ -132,6 +153,10 @@ function main(args)
     offset_from_right = Float64(impulse_cfg["offset_from_right"])
     t0 = Float64(impulse_cfg["t0"])
     tau = Float64(impulse_cfg["tau"])
+    vertical_shape = get(impulse_cfg, "vertical", "mode1")
+    vertical_shape in ("mode1", "uniform") ||
+        error("impulse.vertical must be \"mode1\" or \"uniform\"")
+    uniform = vertical_shape == "uniform"
 
     sigma_x > 0 && tau > 0 && t0 >= 0 ||
         error("Require sigma_x, tau > 0 and t0 >= 0")
@@ -139,6 +164,10 @@ function main(args)
         error("offset_from_right must be between 0 and Lx")
 
     dt = Float64(run_cfg["dt"])
+    free_surface = Bool(get(run_cfg, "free_surface", false))
+    uniform && !free_surface &&
+        error("impulse.vertical = \"uniform\" needs run.free_surface = true: under a rigid lid " *
+              "a depth-uniform push is balanced entirely by pressure and moves no water")
     stop_time = length(args) >= 5 ? parse(Float64, args[5]) : Float64(run_cfg["stop_time"])
     output_interval = Float64(output_cfg["interval"])
 
@@ -185,7 +214,7 @@ function main(args)
 
     forcing_parameters = (;
         x_source = Lx - offset_from_right,
-        sigma_x, t0, tau, delta_u, H
+        sigma_x, t0, tau, delta_u, H, uniform
     )
     u_forcing = Forcing(impulse; parameters=forcing_parameters)
 
@@ -218,7 +247,20 @@ function main(args)
         end
     end
 
-    model = NonhydrostaticModel(grid; model_kwargs...)
+    if free_surface
+        model_kwargs = merge(model_kwargs, (;
+            free_surface = ImplicitFreeSurface(gravitational_acceleration = g)))
+    end
+
+    model = try
+        NonhydrostaticModel(grid; model_kwargs...)
+    catch err
+        if free_surface && err isa MethodError
+            error("This Oceananigans version's NonhydrostaticModel does not accept a free_surface; " *
+                  "update Oceananigans (julia --project=. -e 'using Pkg; Pkg.update(\"Oceananigans\")')")
+        end
+        rethrow()
+    end
 
     # With Flat y, initialization functions take (x, z), not (x, y, z).
     # Map each cell-center z to its corresponding supplied profile value.
@@ -257,14 +299,24 @@ function main(args)
         defVar(ds, "p_nh", Float64, ("z", "x", "t");
                attrib=Dict(
                    "units" => "Pa",
-                   "long_name" => "Pressure not given by g * integral(rho dz): " *
-                                  "rigid-lid surface pressure + nonhydrostatic pressure",
-                   "gauge" => "mean over the top row of cells is zero at every time"
+                   "long_name" => "Pressure not given by g * integral(rho dz from z to 0): " *
+                                  (free_surface ? "free-surface pressure (rho g eta)" :
+                                                  "rigid-lid surface pressure") *
+                                  " + nonhydrostatic pressure",
+                   "gauge" => free_surface ? "absolute: zero pressure at the free surface" :
+                                             "mean over the top row of cells is zero at every time"
                ))
+
+        if free_surface
+            defVar(ds, "eta", Float64, ("x", "t");
+                   attrib=Dict("units" => "m", "long_name" => "Free-surface displacement"))
+        end
 
         ds.attrib["rho_ref_kg_m-3"] = rho_ref
         ds.attrib["bathymetry"] = bathymetry_name
-        ds.attrib["source"] = "Right-side, zero-depth-mean horizontal impulse"
+        ds.attrib["source"] = uniform ? "Right-side, depth-uniform (piston-like) horizontal impulse" :
+                                        "Right-side, zero-depth-mean horizontal impulse"
+        ds.attrib["top_boundary"] = free_surface ? "implicit free surface" : "rigid lid"
 
         frame_number = Ref(0)
         last_saved_time = Ref(-Inf)
@@ -286,11 +338,16 @@ function main(args)
                 (2, 1)
             )
 
-            # The pressure solve fixes p only up to a constant; set the mean
-            # over the top row of cells to zero (atmospheric reference).
+            # Under a rigid lid the pressure solve fixes p only up to a constant: set the
+            # mean over the top row of cells to zero (atmospheric reference). With a free
+            # surface the pressure level is fixed by the surface (it carries g * eta).
             p_xz = Array(interior(nonhydrostatic_pressure(sim.model), :, 1, :))
-            p_xz .-= sum(p_xz[:, end]) / size(p_xz, 1)
+            free_surface || (p_xz .-= sum(p_xz[:, end]) / size(p_xz, 1))
             p_nh_zx = permutedims(rho_ref .* p_xz, (2, 1))
+
+            if free_surface
+                ds["eta"][:, frame_number[]] = vec(Array(interior(sim.model.free_surface.displacement)))
+            end
 
             ds["rho"][:, :, frame_number[]] = rho_zx
             ds["p_nh"][:, :, frame_number[]] = p_nh_zx
