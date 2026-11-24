@@ -3,3 +3,7 @@ data/
 forward_model.sl
 train.sl
 trial/
+OpenFWI/Invnet_models/
+venv/
+*.out
+*.err
